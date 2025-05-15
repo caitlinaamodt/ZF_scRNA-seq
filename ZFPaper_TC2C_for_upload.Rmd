@@ -1,0 +1,519 @@
+
+https://earmingol.github.io/cell2cell/documentation/
+https://earmingol.github.io/cell2cell/tutorials/ASD/01-Tensor-Factorization-ASD/
+https://www.nature.com/articles/s41467-022-31369-2 Paper
+
+```{bash}
+cd /path/to/datafolder_name
+
+#activate your conda environment and intiate python
+conda activate your_conda_env
+python
+```
+#If you get the error "SyntaxError: multiple statements found while compiling a single statement"
+#Use
+echo "set enable-bracketed-paste off" >> ~/.inputrc
+#and restart the python console
+
+```{python}
+# Limit number of cores if necessary - Run this before everything else
+cores = 24
+
+import os
+os.environ['OPENBLAS_NUM_THREADS'] = str(cores)
+os.environ['MKL_NUM_THREADS'] = str(cores)
+import tensorly as tl
+tl.set_backend(tl.get_backend(), local_threadsafe=True)
+```
+
+
+```{python}
+import numpy as np
+import pandas as pd
+
+import cell2cell as c2c
+import scanpy as sc
+
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+```
+
+```{python}
+#Outputs 
+output_folder = './output_folder_name/'
+if not os.path.isdir(output_folder):
+    os.mkdir(output_folder)
+```
+
+```{python}
+data_folder = '/path/to/datafolder_name'
+
+```
+
+```{python}
+first = True
+for file in tqdm(os.listdir(data_folder)):
+    print(file)
+    if '_counts.csv' in file:
+        if first:
+            adata = sc.read_csv(data_folder + file).transpose()
+            first = False
+        else:
+            adata = adata.concatenate(sc.read_csv(data_folder + file).transpose())
+```
+
+```{python}
+adata.obs.index = [idx.split('1-')[0] + '1' for idx in adata.obs.index]
+
+metadata = pd.read_csv(data_folder + '/metadata.csv', index_col=0)
+
+metadata.head()
+
+adata.obs = adata.obs.join(metadata)
+```
+
+
+```{python}
+#Load L-R pairs
+lr_pairs = pd.read_csv('https://raw.githubusercontent.com/LewisLabUCSD/Ligand-Receptor-Pairs/master/Human/Human-2020-Jin-LR-pairs.csv')
+
+lr_pairs.head(2)
+
+int_cols = ('ligand_symbol', 'receptor_symbol')
+
+lr_pairs = c2c.preprocessing.ppi.remove_ppi_bidirectionality(lr_pairs, int_cols)
+
+lr_pairs.shape
+```
+
+```{python}
+exp_dfs = dict()
+
+for condition, df in tqdm(adata.obs.groupby('orig.ident'), total=len(adata.obs['orig.ident'].unique())):
+    cells = list(set(df.index))
+    df.index.name = 'barcode'
+    df = df.reset_index()
+    tmp_adata = adata[cells]
+    sc.pp.filter_genes(tmp_adata, min_cells=3)
+    exp_dfs[condition] = c2c.preprocessing.aggregate_single_cells(tmp_adata.to_df(),
+                                                                  df,
+                                                                  barcode_col='barcode',
+                                                                  celltype_col='coarse.cluster.ids',
+                                                                  method='nn_cell_fraction',
+                                                                 )
+```
+
+
+
+```{python}
+exp_dfs.keys()
+
+genes = set(adata.var.index)
+for k, v in exp_dfs.items():
+    genes = genes.intersection(set(v.index))
+
+
+for k, v in exp_dfs.items():
+    exp_dfs[k] = v.loc[genes,:]
+```
+
+```{python}
+contexts = list(exp_dfs.keys())
+
+context_dict = metadata.set_index('orig.ident')['condition'].to_dict()
+
+context_dict
+
+ppi_functions = dict()
+
+for idx, row in lr_pairs.iterrows():
+    ppi_label = row['interaction_symbol']
+    ppi_functions[ppi_label] = row['annotation']
+```
+
+```{python}
+rnaseq_matrices = [exp_dfs[context] for context in contexts]
+```
+
+```{python}
+tensor = c2c.tensor.InteractionTensor(rnaseq_matrices=rnaseq_matrices,
+                                      ppi_data=lr_pairs2,
+                                      context_names=contexts,
+                                      how='outer',
+                                      complex_sep='&',
+                                      interaction_columns=int_cols,
+                                      communication_score = 'expression_gmean',
+                                     )
+                                     
+
+#how='inner' to include only cell types and genes across all samples
+
+                                     
+```
+
+```{python}
+tensor.tensor.shape
+#(samples, pairs)
+```
+
+```{python}
+#Elbow plot
+fig, error = tensor.elbow_rank_selection(upper_rank=25,
+                                         runs=20,
+                                         init='random',
+                                         automatic_elbow=True,
+                                         filename=output_folder + '/Elbow.svg',
+                                         random_state=888)
+```
+
+```{python}
+#Perform tensor factorization (k=8 is elbow)
+tensor.compute_tensor_factorization(rank=9,
+                                    init='random',
+                                    random_state=888)
+                                    
+                                    
+```
+
+```{python}
+#data grouped by context
+meta_tf = c2c.tensor.generate_tensor_metadata(interaction_tensor=tensor,
+                                              metadata_dicts=[context_dict, ppi_functions, None, None],
+                                              fill_with_order_elements=True
+                                             )
+
+#individual subject
+meta_tf2 = c2c.tensor.generate_tensor_metadata(interaction_tensor=tensor,
+                                               metadata_dicts=[None, ppi_functions, None, None],
+                                               fill_with_order_elements=True
+                                              )
+```
+
+```{python}
+cmaps = ['inferno', 'tab20', 'tab20', 'tab20']
+
+fig, axes = c2c.plotting.tensor_factors_plot(interaction_tensor=tensor,
+                                             order_labels=['Condition', 'Ligand-Receptor Pairs', 'Sender Cells', 'Receiver Cells'],
+                                             metadata = meta_tf,
+                                             sample_col='Element',
+                                             group_col='Category',
+                                             meta_cmaps=cmaps,
+                                             fontsize=14,
+                                             filename=output_folder + '/TensorFactorization.svg'
+                                            )
+
+```
+
+```{python}
+fig, axes = c2c.plotting.tensor_factors_plot(interaction_tensor=tensor,
+                                             order_labels=['Condition', 'Ligand-Receptor Pairs', 'Sender Cells', 'Receiver Cells'],
+                                             metadata = meta_tf2,
+                                             sample_col='Element',
+                                             group_col='Category',
+                                             meta_cmaps=cmaps,
+                                             fontsize=14,
+                                             filename=output_folder + '/TensorFactorization2.svg'
+                                            )
+```
+
+```{python}
+tensor.export_factor_loadings(output_folder + '/Loadings.xlsx')
+
+for i in range(1, tensor.rank+1):
+    print(tensor.get_top_factor_elements('LRs', 'Factor {}'.format(i), 10))
+    print('')
+```
+
+```{python}
+#Generate list of RNA-seq data aggregated into cell types
+# Iterate by sample/context
+# Obtain metadata for context
+    # Single cells in the context
+        # Rename index name to identify the barcodes when aggregating expression
+            # Subset RNAseq data by the single cells in the sample/context
+            
+    # Keep genes in each sample with at least 4 single cells expressing it
+        # Aggregate gene expression of single cells into cell types
+rnaseq_matrices = []
+for context in tqdm(context_names):
+    meta_context = rnaseq.obs.loc[rnaseq.obs['donor_exp_pool'] == context].copy()
+    cells = list(meta_context.index)
+    meta_context.index.name = 'barcode'
+    tmp_data = rnaseq[cells]
+    genes = sc.pp.filter_genes(tmp_data, min_cells=4, inplace=False)[0]
+    tmp_data = tmp_data.to_df().loc[:, genes]
+    exp_df = c2c.preprocessing.aggregate_single_cells(rnaseq_data=tmp_data,
+                                                      metadata=meta_context,
+                                                      barcode_col='barcode',
+                                                      celltype_col='gpt_clusters',
+                                                      method='nn_cell_fraction')
+    rnaseq_matrices.append(exp_df)
+    
+    
+    #celltype_col='gptcelltype', 'gpt_clusters', 'seurat_clusters'
+    
+#For receptors only
+exp_df.to_csv("/data3/caamodt/TC2Cresults_receptors/exp_df.csv")
+scp caamodt@jabba.ucsd.edu:/data3/caamodt/TC2Cresults_receptors/exp_df.csv /Users/caitlinaamodt/Downloads
+```
+
+```{python}
+#For Summer
+meta = meta.reset_index()
+rnaseq.obs['index'] = pd.Categorical(meta.index) 
+rnaseq.obs.set_index('index', inplace=True)
+
+rnaseq_matrices = []
+for context in tqdm(context_names):
+    meta_context = rnaseq.obs.loc[rnaseq.obs['line_x_timepoint'] == context].copy()
+    cells = list(meta_context.index)
+    meta_context.index.name = 'index'
+    tmp_data = rnaseq[cells]
+    genes = sc.pp.filter_genes(tmp_data, min_cells=4, inplace=False)[0]
+    tmp_data = tmp_data.to_df().loc[:, genes]
+    exp_df = c2c.preprocessing.aggregate_single_cells(rnaseq_data=tmp_data,
+                                                      metadata=meta_context,
+                                                      barcode_col='index',
+                                                      celltype_col='classtype1_5_2',
+                                                      method='nn_cell_fraction')
+    rnaseq_matrices.append(exp_df)
+```
+
+```{python}
+# Change gene names to ensembl (here they are annotated as ENSEMBL|SYMBOL)
+matrices = []
+for rna in rnaseq_matrices:
+    tmp = rna.copy()
+    tmp.index = [idx.split('|')[0] for idx in rna.index]
+    matrices.append(tmp)
+
+lr_pairs = c2c.preprocessing.ppi.remove_ppi_bidirectionality(ppi_data=lr_pairs, 
+                                                             interaction_columns=int_columns
+                                                             )
+
+lr_pairs.shape
+```
+example output: (2070, 17)
+
+```{python}
+ppi_functions = dict()
+for idx, row in lr_pairs.iterrows():
+    ppi_label = row[int_columns[0]] + '^' + row[int_columns[1]]
+    ppi_functions[ppi_label] = row['annotation']
+    
+#Receptors only
+ppi_functions = dict()
+for idx, row in lr_pairs.iterrows():
+    ppi_label = row[int_columns[0]]
+    ppi_functions[ppi_label] = row['annotation']
+    
+    
+#Check source to convert to Ensembl if need be
+#https://earmingol.github.io/cell2cell/tutorials/ASD/01-Tensor-Factorization-ASD/
+```
+
+```{python}
+#Build 4D-Communication Tensor
+tensor = c2c.tensor.InteractionTensor(rnaseq_matrices=matrices,
+                                      ppi_data=lr_pairs,
+                                      context_names=context_names,
+                                      how='inner',
+                                      complex_sep='&',
+                                      interaction_columns=('ligand_symbol', 'receptor_symbol'),
+                                      communication_score='expression_mean',
+                                     )
+                                     
+#Receptors only
+tensor = c2c.tensor.InteractionTensor(rnaseq_matrices=matrices,
+                                      ppi_data=lr_pairs,
+                                      context_names=context_names,
+                                      how='inner',
+                                      complex_sep='&',
+                                      interaction_columns=('receptor_symbol'),
+                                      communication_score='expression_mean',
+                                     )
+```
+
+```{python}
+tensor.tensor.shape
+```
+(10, 995, 20, 20)
+
+```{python}
+# If using a GPU, convert tensor & mask into a GPU-manipulable object.
+#if use_gpu:
+#    tensor.tensor = tl.tensor(tensor.tensor, device='cuda:0')
+#    if tensor.mask is not None:
+#        tensor.mask = tl.tensor(tensor.mask, device='cuda:0')
+```
+
+```{python}
+# Put LR pair names from ensembl to symbol (if need be)
+#tensor.order_names[1] = [ensembl_symbol[lr] for lr in tensor.order_names[1]]
+```
+
+```{python}
+meta_tf = c2c.tensor.generate_tensor_metadata(interaction_tensor=tensor,
+                                              metadata_dicts=[context_dict, ppi_functions, None, None],
+                                              fill_with_order_elements=True
+                                             )
+```
+
+```{python}
+#Elbow analysis
+elbow, error = tensor.elbow_rank_selection(upper_rank=25,
+                                           runs=20, # This can be increased for more robust results
+                                           init='random',
+                                           automatic_elbow=True,
+                                           filename=output_folder + '/Elbow.svg',
+                                           random_state=888,
+                                          )
+
+
+
+# If automatic_elbow=True, remove these two lines. To save the figure in that case,
+# add the parameter filename=output_folder + 'Elbow.svg' in the previous function.
+# The number of factors will be saved in tensor.rank
+# Here we selected a number of 9 factors.
+_ = plt.plot(*error[8], 'ro') 
+plt.savefig(output_folder + 'Elbow.svg', dpi=300, bbox_inches='tight')
+```
+28min
+Home
+7:59am-11:21am
+5:37am-2:45pm
+Work
+12:24pm- 3:07pm
+
+```{python}
+tensor.compute_tensor_factorization(rank=9,
+                                    init='svd', 
+                                    random_state=888
+                                   )
+# init='svd' helps to get an global-optimal solution.
+# Replace by 'random' if a memory error is obtained.
+tensor.compute_tensor_factorization(rank=9,
+                                    init='random', 
+                                    random_state=888
+                                   )
+```
+
+                                     
+
+
+
+
+
+#Stats
+```{r}
+#All birds
+Cook<-read.csv("/Users/caitlinaamodt/Desktop/White_Lab/Cook/Cook_LoadingsforTtest.csv", header=T, row.names=1)
+library(useful)
+corner(Cook)
+dim(Cook)
+```
+
+```{r}
+#All birds
+Nonsingers<-Cook[1:8,]
+Singers<-Cook[9:16,]
+Adults<-Cook[c(1:3,9:13),]
+Juveniles<-Cook[c(4:8,14:16),]
+NonA<-Cook[c(1:3),]
+NonJ<-Cook[c(4:8),]
+SA<-Cook[c(9:13),]
+SJ<-Cook[c(14:16),]
+head(Juveniles)
+```
+
+```{r}
+#Adults
+NonA<-Cook[c(1:3),]
+SA<-Cook[c(4:8),]
+head(SA)
+```
+
+```{r}
+#Juvs
+NonJ<-Cook[c(1:5),]
+SJ<-Cook[c(6:8),]
+head(SJ)
+```
+
+
+https://www.rdocumentation.org/packages/MKinfer/versions/1.1/topics/boot.t.test
+```{r}
+library(MKinfer)
+boot.t.test(NonJ$Factor.11, y = SJ$Factor.11,
+       alternative = c("two.sided"),
+       mu = 0, paired = FALSE, var.equal = FALSE,
+       conf.level = 0.95, R = 9999, symmetric = FALSE)
+```
+
+
+
+
+```{r}
+#Bonferroni correction
+library(stats)
+p<-c(0.0008001,	0.0038,	0.3328,	0.08321,	0.0246,	0.008201,	0.1654,	0.028,	0.002,	0.1944)
+p.adjust(p, method = "bonferroni", n = length(p))
+```
+
+
+```{r fig.height = 4, fig.width = 4}
+#Visualize data (Fig 3B)
+library(tidyverse)
+library(hrbrthemes)
+library(viridis)
+
+#All birds
+data <-read.csv("/Users/caitlinaamodt/Desktop/White_Lab/Cook/Cook_LoadingsforFig2.csv", header=T)
+#Adults
+#data <-read.csv( "/Users/caitlinaamodt/Desktop/CookAdult_results_07102023/CookLoadingsforFigsAdults.csv", header=T)
+head(data)
+```
+```{r}
+library(reshape2)
+mdata<-melt(data)
+library(useful)
+corner(mdata)
+```
+
+```{r}
+#Subset by category in a column
+mdata_9<- mdata[mdata$variable == "Factor.9", ]
+```
+
+```{r fig.height = 1.5, fig.width = 1.5}
+# Plot
+mdata_2 <- mdata_9 %>%
+  mutate( Age=factor(Age, levels=c("Juvenile", "Adult")) )
+
+p<-mdata_2 %>%
+  ggplot( aes(x=Age, y=value, fill=Age)) +
+    #geom_boxplot() +
+    geom_violin() +
+    #scale_fill_viridis(discrete = TRUE, alpha=0.6) +
+    geom_jitter(color="black", size=1.5, alpha=0.9,width = 0.1) +
+    theme_bw() +
+    theme(
+      legend.position="none",
+      plot.title = element_text(size=12), 
+      axis.text.x = element_text(size=16, color="black"), 
+      axis.text.y = element_text(size=16, color="black"), 
+      axis.title.x = element_text(size = 16), 
+      axis.title.y = element_text(size = 16)
+    ) +
+    ggtitle("") +
+    xlab("") +
+    ylab("Factor.9 Loadings")
+
+# Use custom color palettes
+p+scale_fill_manual(values=c("#56B4E9", "#999999"))
+```
+
+
+
+
